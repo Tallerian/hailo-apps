@@ -689,6 +689,7 @@ class GStreamerApp:
             picam_thread = threading.Thread(
                 target=picamera_thread,
                 args=(self.pipeline, self.video_width, self.video_height, self.video_format),
+                kwargs={"frame_rate": self.frame_rate},
             )
             self.threads.append(picam_thread)
             picam_thread.start()
@@ -728,31 +729,38 @@ class GStreamerApp:
                 sys.exit(0)
 
 
-def picamera_thread(pipeline, video_width, video_height, video_format, picamera_config=None):
+def picamera_thread(pipeline, video_width, video_height, video_format, picamera_config=None, frame_rate=30):
     hailo_logger.debug("picamera_thread started")
     appsrc = pipeline.get_by_name("app_source")
     appsrc.set_property("is-live", True)
     appsrc.set_property("format", Gst.Format.TIME)
     hailo_logger.debug(f"appsrc properties: {appsrc}")
 
+    fps = int(frame_rate)  # from --frame-rate; drives camera control, appsrc caps and timestamps
+
     with Picamera2() as picam2:
         if picamera_config is None:
-            # Determine main stream size: must be >= lores for Picamera2.
-            # get_camera_resolution returns the nearest standard resolution >= requested.
-            main_width, main_height = get_camera_resolution(video_width, video_height)
+            # Optionally force a sensor mode with PICAM_SENSOR=1920x1200
+            sensor_env = os.environ.get("PICAM_SENSOR")
+            sensor = None
+            if sensor_env:
+                sw, sh = (int(v) for v in sensor_env.lower().split("x"))
+                sensor = {"output_size": (sw, sh), "bit_depth": 10}
+                main_width, main_height = sw, sh
+            else:
+                main_width, main_height = get_camera_resolution(video_width, video_height)
             main = {"size": (main_width, main_height), "format": "RGB888"}
-            controls = {"FrameRate": 30}
+            controls = {"FrameRate": fps}
+            extra = {"sensor": sensor} if sensor else {}
 
-            # If the main and requested sizes match, Picamera2 requires lores < main,
-            # so we skip lores and capture directly from the main stream.
             if main_width == video_width and main_height == video_height:
-                config = picam2.create_preview_configuration(main=main, controls=controls)
+                config = picam2.create_preview_configuration(
+                    main=main, controls=controls, buffer_count=6, **extra)
                 capture_stream = "main"
             else:
                 lores = {"size": (video_width, video_height), "format": "RGB888"}
                 config = picam2.create_preview_configuration(
-                    main=main, lores=lores, controls=controls
-                )
+                    main=main, lores=lores, controls=controls, buffer_count=6, **extra)
                 capture_stream = "lores"
         else:
             config = picamera_config
@@ -767,7 +775,7 @@ def picamera_thread(pipeline, video_width, video_height, video_format, picamera_
         appsrc.set_property(
             "caps",
             Gst.Caps.from_string(
-                f"video/x-raw, format={format_str}, width={width}, height={height}, framerate=30/1, pixel-aspect-ratio=1/1"
+                f"video/x-raw, format={format_str}, width={width}, height={height}, framerate={fps}/1, pixel-aspect-ratio=1/1"
             ),
         )
         picam2.start()
@@ -782,7 +790,7 @@ def picamera_thread(pipeline, video_width, video_height, video_format, picamera_
 
             frame = cv2.cvtColor(frame_data, cv2.COLOR_BGR2RGB)
             buffer = Gst.Buffer.new_wrapped(frame.tobytes())
-            buffer_duration = Gst.util_uint64_scale_int(1, Gst.SECOND, 30)
+            buffer_duration = Gst.util_uint64_scale_int(1, Gst.SECOND, fps)
             buffer.pts = frame_count * buffer_duration
             buffer.duration = buffer_duration
             ret = appsrc.emit("push-buffer", buffer)

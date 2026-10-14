@@ -1,5 +1,5 @@
-person
-bicycle
+drone
+drone
 car
 motorcycle
 airplane

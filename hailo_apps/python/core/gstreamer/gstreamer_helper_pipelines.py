@@ -45,7 +45,8 @@ def get_source_type(input_source):
         return "usb"
     elif input_source.startswith("rpi"):
         return "rpi"
-    elif input_source.startswith("libcamera"):  # Use libcamerasrc element, not suggested
+    # Use libcamerasrc element, not suggested
+    elif input_source.startswith("libcamera"):
         return "libcamera"
     elif input_source.startswith("0x"):
         return "ximage"
@@ -117,23 +118,38 @@ def SOURCE_PIPELINE(
     videoflip_str = f'videoflip name=videoflip_{name} video-direction=horiz ! ' if mirror_image else ''
 
     if source_type == "usb":
-        if no_webcam_compression or is_v4l2loopback_device(video_source):
-            # Use raw (uncompressed) format for v4l2loopback devices (e.g. OBS Virtual Camera)
-            # and when explicitly requested. v4l2loopback does not support JPEG output.
-            source_element = (
-                f'v4l2src device={video_source} name={name} ! '
-                f'video/x-raw, width=640, height=480 ! '
-                f'{videoflip_str}'
-            )
-        else:
-            # Use compressed format for webcam
-            width, height = get_camera_resolution(video_width, video_height)
-            source_element = (
-                f'v4l2src device={video_source} name={name} ! image/jpeg, framerate=30/1, width={width}, height={height} ! '
-                f'{QUEUE(name=f"{name}_queue_decode")} ! '
-                f'decodebin name={name}_decodebin ! '
-                f'{videoflip_str}'
-            )
+        # if no_webcam_compression or is_v4l2loopback_device(video_source):
+        #     # Use raw (uncompressed) format for v4l2loopback devices (e.g. OBS Virtual Camera)
+        #     # and when explicitly requested. v4l2loopback does not support JPEG output.
+        #     source_element = (
+        #         f'v4l2src device={video_source} name={name} ! '
+        #         f'video/x-raw, width=640, height=480 ! '
+        #         f'{videoflip_str}'
+        #     )
+        # else:
+        #     # Use compressed format for webcam
+        #     width, height = get_camera_resolution(video_width, video_height)
+        #     source_element = (
+        #         f'v4l2src device={video_source} name={name} ! image/jpeg, framerate=30/1, width={width}, height={height} ! '
+        #         f'{QUEUE(name=f"{name}_queue_decode")} ! '
+        #         f'decodebin name={name}_decodebin ! '
+        #         f'{videoflip_str}'
+        #     )
+
+        # ---- INTEL REALSENSE CAMERA ----
+        # source_element = (
+        #     f'v4l2src device=/dev/video4 name={name} ! '
+        #     f'video/x-raw, format=YUY2, width={video_width}, height={video_height}, framerate={frame_rate}/1 '
+        #     + (f'! {videoflip_str} ' if videoflip_str else ' ')
+        # )
+
+        # ---- THERMAL CAMERA (e.g., FLIR) ----
+        source_element = (
+            f'v4l2src device=/dev/video0 name={name} ! image/jpeg,'
+            f'width={video_width}, height={video_height}, framerate={frame_rate}/1 ! jpegdec '
+            + (f'! {videoflip_str} ' if videoflip_str else ' ')
+        )
+
     elif source_type == "rpi":
         rpi_videoflip_str = "videoflip name=videoflip video-direction=horiz ! " if mirror_image else ""
         source_element = (
@@ -148,7 +164,8 @@ def SOURCE_PIPELINE(
         )
     elif source_type == "ximage":
         source_element = (
-            f"ximagesrc xid={video_source} ! {QUEUE(name=f'{name}queue_scale_')} ! videoscale ! "
+            f"ximagesrc xid={video_source} ! {QUEUE(name=f'{name}queue_scale_')
+                                              } ! videoscale ! "
         )
     elif source_type == 'rtsp':  # RTSP stream handling
         source_element = (
@@ -196,7 +213,8 @@ def INFERENCE_PIPELINE(
     # Extra hailonet parameters
     scheduler_timeout_ms=None,
     scheduler_priority=None,
-    vdevice_group_id=SHARED_VDEVICE_GROUP_ID,  # Don't change it - this is aligned across multiple apps
+    # Don't change it - this is aligned across multiple apps
+    vdevice_group_id=SHARED_VDEVICE_GROUP_ID,
     multi_process_service=None,
 ):
     """Creates a GStreamer pipeline string for inference and post-processing using a user-provided shared object file.
@@ -239,7 +257,8 @@ def INFERENCE_PIPELINE(
             # Invalid: architecture or config doesn't support it
             multi_process_service = None  # Disable it
             # Optionally log a warning
-            print(f"Warning: multi-process-service not supported on {arch} or disabled in config")
+            print(
+                f"Warning: multi-process-service not supported on {arch} or disabled in config")
     multi_process_service_str = (
         f" multi-process-service={str(multi_process_service).lower()} "
         if multi_process_service is not None
@@ -301,7 +320,8 @@ def INFERENCE_PIPELINE_WRAPPER(
         str: A string representing the GStreamer pipeline for the inference wrapper.
     """
     # Get the directory for post-processing shared objects
-    tappas_post_process_dir = os.environ.get(TAPPAS_POSTPROC_PATH_KEY, TAPPAS_POSTPROC_PATH_DEFAULT)
+    tappas_post_process_dir = os.environ.get(
+        TAPPAS_POSTPROC_PATH_KEY, TAPPAS_POSTPROC_PATH_DEFAULT)
     whole_buffer_crop_so = os.path.join(
         tappas_post_process_dir, "cropping_algorithms/libwhole_buffer.so"
     )
@@ -311,7 +331,8 @@ def INFERENCE_PIPELINE_WRAPPER(
         f"{QUEUE(name=f'{name}_input_q')} ! "
         f"hailocropper name={name}_crop so-path={whole_buffer_crop_so} function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true "
         f"hailoaggregator name={name}_agg "
-        f"{name}_crop. ! {QUEUE(max_size_buffers=bypass_max_size_buffers, name=f'{name}_bypass_q')} ! {name}_agg.sink_0 "
+        f"{name}_crop. ! {QUEUE(max_size_buffers=bypass_max_size_buffers, name=f'{name}_bypass_q')} ! {
+            name}_agg.sink_0 "
         f"{name}_crop. ! {inner_pipeline} ! {name}_agg.sink_1 "
         f"{name}_agg. ! {QUEUE(name=f'{name}_output_q')} "
     )
@@ -399,16 +420,17 @@ def USER_CALLBACK_PIPELINE(name="identity_callback"):
         str: A string representing the GStreamer pipeline for the user callback element.
     """
     # Construct the user callback pipeline string
-    user_callback_pipeline = f"{QUEUE(name=f'{name}_q')} ! identity name={name} "
+    user_callback_pipeline = f"{QUEUE(name=f'{name}_q')} ! identity name = {
+        name} "
 
     return user_callback_pipeline
 
 
 def TRACKER_PIPELINE(
     class_id,
-    kalman_dist_thr=0.8,
-    iou_thr=0.9,
-    init_iou_thr=0.7,
+    kalman_dist_thr=1.0,
+    iou_thr=1.0,
+    init_iou_thr=1.0,
     keep_new_frames=2,
     keep_tracked_frames=15,
     keep_lost_frames=2,
@@ -488,12 +510,14 @@ def CROPPER_PIPELINE(
         f"hailoaggregator name={name}_agg "
         # bypass
         f"{name}_cropper. ! "
-        f"{QUEUE(name=f'{name}_bypass_q', max_size_buffers=bypass_max_size_buffers)} ! {name}_agg.sink_0 "
+        f"{QUEUE(name=f'{name}_bypass_q', max_size_buffers=bypass_max_size_buffers)} ! {
+            name}_agg.sink_0 "
         # pipeline for the actual inference
         f"{name}_cropper. ! {inner_pipeline} ! {name}_agg.sink_1 "
         # aggregator output
         f"{name}_agg. ! {QUEUE(name=f'{name}_output_q')} "
     )
+
 
 def TILE_CROPPER_PIPELINE(
     inner_pipeline,
@@ -558,6 +582,7 @@ def TILE_CROPPER_PIPELINE(
         f'{name}_agg. ! {QUEUE(name=f"{name}_output_q")} '
     )
 
+
 def VIDEO_STREAM_PIPELINE(port=5004, host="127.0.0.1", bitrate=2048):
     """Creates a GStreamer pipeline string portion for encoding and streaming video over UDP.
 
@@ -578,7 +603,8 @@ def VIDEO_STREAM_PIPELINE(port=5004, host="127.0.0.1", bitrate=2048):
     encoder = f"x264enc tune=zerolatency bitrate={bitrate} speed-preset=ultrafast"
     return (
         f"videoconvert ! video/x-raw,format=I420 ! "  # x264enc often prefers I420
-        f"{encoder} ! video/x-h264,profile=baseline ! "  # Add profile for better compatibility potentially
+        # Add profile for better compatibility potentially
+        f"{encoder} ! video/x-h264,profile=baseline ! "
         f"rtph264pay config-interval=1 pt=96 ! "
         f"udpsink host={host} port={port} sync=false async=false"
     )

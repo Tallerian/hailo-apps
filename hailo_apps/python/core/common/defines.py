@@ -297,7 +297,7 @@ RESOURCE_TYPES = {
     RESOURCE_TYPE_VIDEO,
 }
 
-CAMERA_KEYWORDS = ["usb", "rpi"]
+CAMERA_KEYWORDS = ["usb", "rpi", "realsense"]
 
 # Video examples
 BASIC_PIPELINES_VIDEO_EXAMPLE_NAME = "example.mp4"

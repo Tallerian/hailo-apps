@@ -25,6 +25,9 @@ from hailo_apps.python.core.gstreamer.gstreamer_helper_pipelines import (
     SOURCE_PIPELINE,
     USER_CALLBACK_PIPELINE,
 )
+from datetime import datetime
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"thermal_{timestamp}"
 
 hailo_logger = get_logger(__name__)
 
@@ -45,10 +48,10 @@ class GStreamerDetectionSimpleApp(GStreamerApp):
             default=None,
             help="Path to costume labels JSON file",
         )
-        
+
         # Handle --list-models flag before full initialization
         handle_list_models_flag(parser, SIMPLE_DETECTION_PIPELINE)
-        
+
         hailo_logger.info("Initializing GStreamer Detection Simple App...")
         super().__init__(parser, user_data)
         # Override width/height if not set via parser
@@ -65,7 +68,8 @@ class GStreamerDetectionSimpleApp(GStreamerApp):
         nms_iou_threshold = 0.45
         if (
             self.options_menu.input is None
-        ):  # Setting up a new application-specific default video (overrides the default video set in the GStreamerApp constructor)
+            # Setting up a new application-specific default video (overrides the default video set in the GStreamerApp constructor)
+        ):
             self.video_source = get_resource_path(
                 pipeline_name=SIMPLE_DETECTION_PIPELINE,
                 resource_type=RESOURCES_VIDEOS_DIR_NAME,
@@ -89,7 +93,8 @@ class GStreamerDetectionSimpleApp(GStreamerApp):
             arch=self.arch,
             model=SIMPLE_DETECTION_POSTPROCESS_SO_FILENAME,
         )
-        hailo_logger.info(f"Using post-process shared object: {self.post_process_so}")
+        hailo_logger.info(
+            f"Using post-process shared object: {self.post_process_so}")
 
         self.post_function_name = SIMPLE_DETECTION_POSTPROCESS_FUNCTION
 
@@ -117,7 +122,8 @@ class GStreamerDetectionSimpleApp(GStreamerApp):
             video_width=self.video_width,
             video_height=self.video_height,
             frame_rate=self.frame_rate,
-            sync=self.sync,
+            # sync=self.sync,
+            sync=False,
             no_webcam_compression=True,
         )
 
@@ -140,6 +146,19 @@ class GStreamerDetectionSimpleApp(GStreamerApp):
             f"{user_callback_pipeline} ! "
             f"{display_pipeline}"
         )
+
+        # pipeline_string = (
+        #     f"{source_pipeline} ! "
+        #     f"tee name=t "
+
+        #     # Branch 1: recording
+        #     f"t. ! queue ! videoconvert ! x264enc tune=zerolatency ! mp4mux ! filesink location={filename}.mp4 "
+
+        #     # Branch 2: inference + display
+        #     f"t. ! queue ! {detection_pipeline} ! "
+        #     f"{user_callback_pipeline} ! "
+        #     f"{display_pipeline}"
+        # )
         hailo_logger.info(f"Pipeline string: {pipeline_string}")
         return pipeline_string
 
@@ -156,4 +175,3 @@ def main():
 if __name__ == "__main__":
     hailo_logger.info("Starting the GStreamer Detection Simple App...")
     main()
-

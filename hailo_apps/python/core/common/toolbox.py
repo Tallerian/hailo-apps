@@ -11,6 +11,7 @@ import numpy as np
 import re
 import threading
 from enum import Enum
+import pyrealsense2 as rs
 
 try:
     from hailo_apps.python.core.common.defines import (
@@ -36,7 +37,12 @@ except ImportError:
 
 logger = get_logger(__name__)
 
+# ── RealSense globals ─────────────────────────────────────────────────────────
+_rs_pipeline: Optional[rs.pipeline] = None
+_rs_align: Optional[rs.align] = None
 
+
+_rs_raw_queue = queue.Queue(maxsize=60)
 
 class PiCamera2CaptureAdapter:
     """
@@ -268,6 +274,42 @@ def open_rpi_camera():
 def is_stream_url(input_arg: str) -> bool:
     return input_arg.startswith(("http://", "https://", "rtsp://"))
 
+def _open_rs_camera(resolution: Optional[str]) -> None:
+    """Start the RealSense pipeline (called once)."""
+    global _rs_pipeline, _rs_align
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+
+    align = rs.align(rs.stream.color)
+    pipeline.start(config)
+
+    _rs_pipeline = pipeline
+    _rs_align = align
+    logger.info("RealSense camera started at 1280x720")
+
+    while True:
+        frames = _rs_pipeline.wait_for_frames()
+        aligned = _rs_align.process(frames)
+        depth_frame = aligned.get_depth_frame()
+        color_frame = aligned.get_color_frame()
+
+        if not depth_frame or not color_frame:
+            continue
+
+        if _rs_raw_queue.full():
+            _rs_raw_queue.get_nowait()
+        _rs_raw_queue.put_nowait((
+            np.copy(np.asanyarray(color_frame.get_data())),
+            np.copy(np.asanyarray(depth_frame.get_data()))
+        ))
+
+
+def read_rs_frame() -> tuple[np.ndarray, np.ndarray]:
+    global _rs_raw_queue
+    return _rs_raw_queue.get()
 
 # -------------------------------------------------------------------
 # Main entry: init_input_source
@@ -299,6 +341,10 @@ def init_input_source(input_src: str, batch_size: int, resolution: Optional[str]
         cap = open_usb_camera(resolution)
         logger.info("Using USB camera")
         return cap, None, "usb"
+    
+    if src == "realsense":
+        realsense_thread = threading.Thread(target=_open_rs_camera, args=(resolution,))
+        return None, None, "realsense", realsense_thread
 
     # ------------------------------------------------
     # 2) Raspberry Pi camera
@@ -364,6 +410,39 @@ def init_input_source(input_src: str, batch_size: int, resolution: Optional[str]
         sys.exit(1)
 
     return None, images, "images"
+
+
+def initialise_rs_camera(resolution: Optional[str]):
+    global __init_rs_camera, __rs_pipeline, __rs_config
+    __rs_pipeline = rs.pipeline()
+    __rs_config = rs.config()
+
+    __rs_config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+    __rs_config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    
+    __rs_align = rs.align(rs.stream.color)
+    __rs_pipeline.start(__rs_config)
+
+def init_input_source_rs(resolution: Optional[str]):
+
+    if __init_rs_camera is False:
+        initialise_rs_camera(resolution)
+    else:
+        while True:
+            frames = __rs_pipeline.wait_for_frames()
+            aligned_frames = __rs_align.process(frames)
+            depth_frame = aligned_frames.get_depth_frame()
+            color_frame = aligned_frames.get_color_frame()
+
+            if not depth_frame or not color_frame:
+                continue
+
+            depth_image = np.asanyarray(depth_frame.get_data())
+            color_image = np.asanyarray(color_frame.get_data())
+
+
+
+
 
 
 def load_json_file(path: str) -> Dict[str, Any]:
@@ -530,7 +609,7 @@ def id_to_color(idx):
 def preprocess(images: List[np.ndarray], cap: cv2.VideoCapture, framerate: float, batch_size: int,
                input_queue: queue.Queue, width: int, height: int, cap_processing_mode: Optional[CapProcessingMode],
                preprocess_fn: Optional[Callable[[np.ndarray, int, int], np.ndarray]] = None,
-               stop_event: Optional[threading.Event] = None) -> None:
+               stop_event: Optional[threading.Event] = None, rs_use: bool = False) -> None:
 
     """
     Preprocess and enqueue images or camera frames into the input queue as they are ready.
@@ -549,10 +628,15 @@ def preprocess(images: List[np.ndarray], cap: cv2.VideoCapture, framerate: float
     """
     preprocess_fn = preprocess_fn or default_preprocess
 
-    if cap is None:
-        preprocess_images(images, batch_size, input_queue, width, height, preprocess_fn)
+    if rs_use:
+        print("---- Realsense in use")
+        preprocess_from_rs_cap(batch_size, input_queue, width, height, cap_processing_mode, preprocess_fn, stop_event)
+
     else:
-        preprocess_from_cap(cap, batch_size, input_queue, width, height, cap_processing_mode, preprocess_fn, framerate, stop_event)
+        if cap is None:
+            preprocess_images(images, batch_size, input_queue, width, height, preprocess_fn)
+        else:
+            preprocess_from_cap(cap, batch_size, input_queue, width, height, cap_processing_mode, preprocess_fn, framerate, stop_event)
 
     input_queue.put(None)  #Add sentinel value to signal end of input
 
@@ -685,6 +769,68 @@ def preprocess_from_cap(
     # Flush last partial batch
     if frames and not should_stop():
         input_queue.put((frames, processed))
+
+    input_queue.put(None)
+
+def preprocess_from_rs_cap(
+    batch_size: int,
+    input_queue: queue.Queue,
+    width: int,
+    height: int,
+    mode: CapProcessingMode,
+    preprocess_fn: Callable[[np.ndarray, int, int], np.ndarray],
+    target_fps: Optional[float] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    """
+    RealSense variant of preprocess_from_cap.
+    Pushes (frames, processed, depth_frames) triples onto input_queue
+    instead of (frames, processed), so depth is available downstream.
+    """
+
+    print(f"I have been called")
+
+    def should_stop() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    if mode == CapProcessingMode.CAMERA_FRAME_DROP:
+        if not target_fps or target_fps <= 0:
+            raise ValueError("CAMERA_FRAME_DROP requires a positive target_fps")
+
+    next_keep_ts = time.monotonic()
+    keep_period = (1.0 / float(target_fps)) if mode == CapProcessingMode.CAMERA_FRAME_DROP else None
+
+    frames: list[np.ndarray] = []
+    processed: list[np.ndarray] = []
+    depth_frames: list[np.ndarray] = []
+
+    frame_idx = 0
+
+    while not should_stop():
+        color_bgr, depth = read_rs_frame()   # your existing helper
+        frame_idx += 1
+
+        # CAMERA_FRAME_DROP — same logic as original
+        if mode == CapProcessingMode.CAMERA_FRAME_DROP:
+            now = time.monotonic()
+            if now < next_keep_ts:
+                logger.debug(f"[DROP] frame={frame_idx}")
+                continue
+            next_keep_ts += keep_period
+
+        # VIDEO_PACE makes no sense for a live camera — skip it
+
+        frame_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        frames.append(frame_rgb)
+        processed.append(preprocess_fn(frame_rgb, width, height))
+        depth_frames.append(depth)
+
+        if len(frames) >= batch_size:
+            input_queue.put((frames, processed, depth_frames))
+            frames, processed, depth_frames = [], [], []
+
+    if frames and not should_stop():
+        input_queue.put((frames, processed, depth_frames))
 
     input_queue.put(None)
 
@@ -842,6 +988,7 @@ def visualize(
             # (frame, inference_result)                     → standard pipelines
             # (frame, inference_result, extra_metadata...)  → pipelines that attach additional context
             original_frame, inference_result, *metadata = result
+            depth = metadata[0] if metadata else None
 
             # Quit mode:
             # Frames may still arrive from other threads.
@@ -856,9 +1003,15 @@ def visualize(
             # Run visualization callback
             # If extra metadata exists, pass it to the callback.
             if metadata:
-                frame_with_detections = callback(original_frame, inference_result, metadata[0])
+                if depth is not None and depth is not False:
+                    frame_with_detections = callback(original_frame, inference_result, depth)
+                else:
+                    frame_with_detections = callback(original_frame, inference_result, metadata[0])
             else:
-                frame_with_detections = callback(original_frame, inference_result)
+                if depth is not None and depth is not False:
+                    frame_with_detections = callback(original_frame, inference_result, depth)
+                else:
+                    frame_with_detections = callback(original_frame, inference_result)
 
             if fps_tracker is not None:
                 fps_tracker.increment()
@@ -868,7 +1021,7 @@ def visualize(
             frame_to_show = resize_frame_for_output(bgr_frame, output_resolution)
 
             # Display / Save
-            if cap is not None:
+            if True:
                 cv2.imshow("Output", frame_to_show)
                 if save_stream_output and out is not None and frame_width and frame_height:
                     out.write(cv2.resize(frame_to_show, (frame_width, frame_height)))

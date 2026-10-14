@@ -53,10 +53,10 @@ class GStreamerDetectionApp(GStreamerApp):
             default=None,
             help="Path to costume labels JSON file",
         )
-        
+
         # Handle --list-models flag before full initialization
         handle_list_models_flag(parser, DETECTION_PIPELINE)
-        
+
         hailo_logger.info("Initializing GStreamer Detection App...")
 
         super().__init__(parser, user_data)
@@ -74,8 +74,8 @@ class GStreamerDetectionApp(GStreamerApp):
         # Override batch_size if not set via parser (default is 2 for detection)
         if self.batch_size == 1:
             self.batch_size = 2
-        nms_score_threshold = 0.3
-        nms_iou_threshold = 0.45
+        nms_score_threshold = 0.05
+        nms_iou_threshold = 0.05
 
         # Architecture is already handled by GStreamerApp parent class
         # Use self.arch which is set by parent
@@ -87,7 +87,7 @@ class GStreamerDetectionApp(GStreamerApp):
             arch=self.arch
         )
 
-            # Set the post-processing shared object file
+        # Set the post-processing shared object file
         self.post_process_so = get_resource_path(
             DETECTION_PIPELINE, RESOURCES_SO_DIR_NAME, self.arch, DETECTION_POSTPROCESS_SO_FILENAME
         )
@@ -95,10 +95,11 @@ class GStreamerDetectionApp(GStreamerApp):
         self.post_function_name = DETECTION_POSTPROCESS_FUNCTION
         # User-defined label JSON file
         self.labels_json = self.options_menu.labels_json
-        if self.labels_json is None: # if no labels JSON file is provided, try auto-detect it from the HEF file
+        if self.labels_json is None:  # if no labels JSON file is provided, try auto-detect it from the HEF file
             self.labels_json = get_hef_labels_json(self.hef_path)
             if self.labels_json is not None:
-                hailo_logger.info("Auto detected Labels JSON: %s", self.labels_json)
+                hailo_logger.info(
+                    "Auto detected Labels JSON: %s", self.labels_json)
 
         hailo_logger.info(
             "Resources | hef=%s | post_so=%s | post_fn=%s | labels_json=%s",
@@ -110,7 +111,8 @@ class GStreamerDetectionApp(GStreamerApp):
 
         # Validate resource paths
         if self.hef_path is None or not Path(self.hef_path).exists():
-            hailo_logger.error("HEF path is invalid or missing: %s", self.hef_path)
+            hailo_logger.error(
+                "HEF path is invalid or missing: %s", self.hef_path)
         if self.post_process_so is None or not Path(self.post_process_so).exists():
             hailo_logger.error(
                 "Post-process .so path is invalid or missing: %s", self.post_process_so
@@ -138,7 +140,8 @@ class GStreamerDetectionApp(GStreamerApp):
             video_width=self.video_width,
             video_height=self.video_height,
             frame_rate=self.frame_rate,
-            sync=self.sync,
+            # sync=self.sync,
+            sync=False,
         )
         detection_pipeline = INFERENCE_PIPELINE(
             hef_path=self.hef_path,
@@ -148,18 +151,39 @@ class GStreamerDetectionApp(GStreamerApp):
             config_json=self.labels_json,
             additional_params=self.thresholds_str,
         )
-        detection_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(detection_pipeline)
+        detection_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(
+            detection_pipeline)
         tracker_pipeline = TRACKER_PIPELINE(class_id=1)
         user_callback_pipeline = USER_CALLBACK_PIPELINE()
         display_pipeline = DISPLAY_PIPELINE(
             video_sink=self.video_sink, sync=self.sync, show_fps=self.show_fps
         )
 
+        # pipeline_string = (
+        #     f"{source_pipeline} ! "
+        #     f"{detection_pipeline_wrapper} ! "
+        #     f"{tracker_pipeline} ! "
+        #     f"{user_callback_pipeline} ! "
+        #     f"{display_pipeline}"
+        # )
+
+        # pipeline_string = (
+        #     f"{source_pipeline} ! "
+        #     f"{detection_pipeline_wrapper} ! "
+        #     # f"{tracker_pipeline} ! "
+        #     # f"{user_callback_pipeline} ! "
+        #     f"fakesink"
+        #     f"{display_pipeline}"
+        # )
+        # pipeline_string = (
+        #     f"{source_pipeline} ! "
+        #     f"{detection_pipeline_wrapper} ! "
+        #     f"fpsdisplaysink name=hailo_display video-sink=fakesink sync=false "
+        #     f"text-overlay=false signal-fps-measurements=true"
+        # )
         pipeline_string = (
             f"{source_pipeline} ! "
             f"{detection_pipeline_wrapper} ! "
-            f"{tracker_pipeline} ! "
-            f"{user_callback_pipeline} ! "
             f"{display_pipeline}"
         )
         hailo_logger.debug("Pipeline string: %s", pipeline_string)

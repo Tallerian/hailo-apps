@@ -7,6 +7,7 @@ from functools import partial
 from types import SimpleNamespace
 import numpy as np
 from pathlib import Path
+from typing import Optional
 import collections
 try:
     from hailo_apps.python.core.tracker.byte_tracker import BYTETracker
@@ -27,7 +28,7 @@ try:
     )
     from hailo_apps.python.core.common.parser import get_standalone_parser
     from hailo_apps.python.core.common.hailo_logger import get_logger, init_logging, level_from_args
-    from hailo_apps.python.standalone_apps.object_detection.object_detection_post_process import inference_result_handler
+    from hailo_apps.python.standalone_apps.object_detection.object_detection_post_process import inference_result_handler, inference_result_handler_depth
     from hailo_apps.python.core.common.core import handle_and_resolve_args
 except ImportError:
     # Running as a plain script: add repo root so `import hailo_apps` works.
@@ -58,11 +59,12 @@ except ImportError:
     )
     from hailo_apps.python.core.common.parser import get_standalone_parser
     from hailo_apps.python.core.common.hailo_logger import get_logger, init_logging, level_from_args
-    from hailo_apps.python.standalone_apps.object_detection.object_detection_post_process import inference_result_handler
+    from hailo_apps.python.standalone_apps.object_detection.object_detection_post_process import inference_result_handler, inference_result_handler_depth
 
 APP_NAME = Path(__file__).stem
 logger = get_logger(__name__)
 
+realsense_thread = False
 
 def parse_args():
     """
@@ -116,13 +118,20 @@ def run_inference_pipeline(net, input_src, batch_size, labels, output_dir,
     """
     Initialize queues, HailoAsyncInference instance, and run the inference.
     """
+    global realsense_thread
     labels = get_labels(labels)
+    print(len(labels))
     config_data = load_json_file("config.json")
 
     # Initialize input source from string: "camera", video file, or image folder.
-    cap, images, input_type = init_input_source(input_src, batch_size, camera_resolution)
+    intput_source_result = init_input_source(input_src, batch_size, camera_resolution)
+    if len(intput_source_result) == 4:
+        cap, images, input_type, realsense_thread = init_input_source(input_src, batch_size, camera_resolution)
+    else:
+        cap, images, input_type = init_input_source(input_src, batch_size, camera_resolution)
+    
     cap_processing_mode = None
-    if cap is not None:
+    if cap is not None or input_type == "realsense":
         cap_processing_mode = select_cap_processing_mode(input_type, save_output, frame_rate)
 
     stop_event = threading.Event()
@@ -139,17 +148,31 @@ def run_inference_pipeline(net, input_src, batch_size, labels, output_dir,
     input_queue = queue.Queue(MAX_INPUT_QUEUE_SIZE)
     output_queue = queue.Queue(MAX_OUTPUT_QUEUE_SIZE)
 
-    post_process_callback_fn = partial(
-        inference_result_handler, labels=labels,
+    if input_type == "realsense":
+        post_process_callback_fn = partial(
+        inference_result_handler_depth, labels=labels,
         config_data=config_data, tracker=tracker, draw_trail=draw_trail
     )
+    else:
+        post_process_callback_fn = partial(
+            inference_result_handler, labels=labels,
+            config_data=config_data, tracker=tracker, draw_trail=draw_trail
+        )
 
+    print("--- Running HailoInfer")
     hailo_inference = HailoInfer(net, batch_size)
     height, width, _ = hailo_inference.get_input_shape()
 
-    preprocess_thread = threading.Thread(
-        target=preprocess, args=(images, cap, frame_rate, batch_size, input_queue, width, height, cap_processing_mode, None, stop_event)
+    if input_type == "realsense":
+        print(f"Running pre-process")
+        preprocess_thread = threading.Thread(
+        target=preprocess, args=(images, cap, frame_rate, batch_size, input_queue, width, height, cap_processing_mode, None, stop_event, True)
     )
+
+    else:
+        preprocess_thread = threading.Thread(
+            target=preprocess, args=(images, cap, frame_rate, batch_size, input_queue, width, height, cap_processing_mode, None, stop_event)
+        )
     postprocess_thread = threading.Thread(
         target=visualize, 
         args=(output_queue, cap, save_output, output_dir,
@@ -159,6 +182,8 @@ def run_inference_pipeline(net, input_src, batch_size, labels, output_dir,
         target=infer, args=(hailo_inference, input_queue, output_queue, stop_event)
     )
 
+    if realsense_thread:
+        realsense_thread.start()
     preprocess_thread.start()
     postprocess_thread.start()
     infer_thread.start()
@@ -166,6 +191,8 @@ def run_inference_pipeline(net, input_src, batch_size, labels, output_dir,
     if show_fps:
         fps_tracker.start()
 
+    if realsense_thread:
+        realsense_thread.join()
     preprocess_thread.join()
     infer_thread.join()
     postprocess_thread.join()
@@ -207,14 +234,27 @@ def infer(hailo_inference, input_queue, output_queue, stop_event):
         if stop_event.is_set():
             continue  # Skip processing if stop signal is set
 
-        input_batch, preprocessed_batch = next_batch
+        depth_frames = False
 
-        # Prepare the callback for handling the inference result
-        inference_callback_fn = partial(
-            inference_callback,
-            input_batch=input_batch,
-            output_queue=output_queue
-        )
+        if len(next_batch) == 3:
+            input_batch, preprocessed_batch, depth_frames = next_batch
+        else:
+            input_batch, preprocessed_batch = next_batch
+
+        if depth_frames:
+            # Prepare the callback for handling the inference result
+            inference_callback_fn = partial(
+                inference_callback,
+                input_batch=input_batch,
+                output_queue=output_queue,
+                depth_frames = depth_frames
+            )
+        else:
+            inference_callback_fn = partial(
+                inference_callback,
+                input_batch=input_batch,
+                output_queue=output_queue
+            )
 
 
         while len(pending_jobs) >= MAX_ASYNC_INFER_JOBS:
@@ -233,7 +273,8 @@ def inference_callback(
     completion_info,
     bindings_list: list,
     input_batch: list,
-    output_queue: queue.Queue
+    output_queue: queue.Queue,
+    depth_frames: Optional[list] = None,
 ) -> None:
     """
     infernce callback to handle inference results and push them to a queue.
@@ -257,7 +298,8 @@ def inference_callback(
                     )
                     for name in bindings._output_names
                 }
-            output_queue.put((input_batch[i], result))
+            depth = depth_frames[i] if depth_frames is not None else None
+            output_queue.put((input_batch[i], result, depth))
 
 def main() -> None:
     """

@@ -39,6 +39,25 @@ def inference_result_handler(original_frame, infer_results, labels, config_data,
     frame_with_detections = draw_detections(detections, original_frame, labels, tracker=tracker, draw_trail=draw_trail)
     return frame_with_detections
 
+def inference_result_handler_depth(original_frame, infer_results, depth, labels, config_data, tracker=None, draw_trail=False):
+    """
+    Processes inference results and draw detections (with optional tracking).
+
+    Args:
+        infer_results (list): Raw output from the model.
+        original_frame (np.ndarray): Original image frame.
+        labels (list): List of class labels.
+        enable_tracking (bool): Whether tracking is enabled.
+        tracker (BYTETracker, optional): ByteTrack tracker instance.
+
+    Returns:
+        np.ndarray: Frame with detections or tracks drawn.
+    """
+    print("Running Inference results")
+    detections = extract_detections(original_frame, infer_results, config_data)  # Should return dict with boxes, classes, scores
+    frame_with_detections = draw_detections(detections, original_frame, labels, tracker=tracker, draw_trail=draw_trail, distances = depth)
+    return frame_with_detections
+
 
 def draw_detection(image: np.ndarray, box: list, labels: list, score: float, color: tuple, track=False):
     """
@@ -136,11 +155,10 @@ def extract_detections(image: np.ndarray, detections: list, config_data) -> dict
     all_detections = []
 
     for class_id, detection in enumerate(detections):
-        for det in detection:
-            bbox, score = det[:4], det[4]
-            if score >= score_threshold:
-                denorm_bbox = denormalize_and_rm_pad(bbox, size, padding_length, img_height, img_width)
-                all_detections.append((score, class_id, denorm_bbox))
+        bbox, score = detection[:4], detection[4]
+        if score >= score_threshold:
+            denorm_bbox = denormalize_and_rm_pad(bbox, size, padding_length, img_height, img_width)
+            all_detections.append((score, class_id, denorm_bbox))
 
     # Sort all detections by score descending
     all_detections.sort(reverse=True, key=lambda x: x[0])
@@ -158,7 +176,7 @@ def extract_detections(image: np.ndarray, detections: list, config_data) -> dict
     }
 
 
-def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None, draw_trail=False) -> np.ndarray:
+def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None, draw_trail=False, distances=None) -> np.ndarray:
     """
     Draw detections or tracking results on the image.
 
@@ -172,6 +190,8 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None,
     Returns:
         np.ndarray: Annotated image.
     """
+
+    print(f"Displaying detections")
 
     # Extract detection data from the dictionary
     boxes = detections["detection_boxes"]  # List of [xmin,ymin,xmaxm, ymax] boxes
@@ -201,10 +221,19 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None,
             x1, y1, x2, y2 = track.tlbr  # Bounding box (top-left, bottom-right)
             xmin, ymin, xmax, ymax = map(int, [x1, y1, x2, y2])
             best_idx = find_best_matching_detection_index(track.tlbr, boxes)
-            color = tuple(id_to_color(classes[best_idx]).tolist())  # Color based on class
+            if distances is not None:
+                depth_roi = distances[ymin:ymax, xmin:xmax]
+                min_depth = depth_roi.min() if depth_roi.size > 0 else 0.0
+                dist_label = f"{min_depth/1000:.2f}m"
+            else:
+                dist_label = None
+            label = [labels[classes[best_idx]], f"ID {track_id}"]
+            if dist_label:
+                print(f"detected distance = {min_depth/1000:.2f}m")
+                label.append(dist_label)
+            color = tuple(id_to_color(classes[best_idx]).tolist())
             if best_idx is None:
-                draw_detection(img_out, [xmin, ymin, xmax, ymax], f"ID {track_id}",
-                               track.score * 100.0, color, track=True)
+                draw_detection(img_out, [xmin, ymin, xmax, ymax], label, track.score * 100.0, color, track=True)
             else:
                 draw_detection(img_out, [xmin, ymin, xmax, ymax], [labels[classes[best_idx]], f"ID {track_id}"],
                                track.score * 100.0, color, track=True)
@@ -237,8 +266,19 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None,
     else:
         # No tracking — draw raw model detections
         for idx in range(num_detections):
-            color = tuple(id_to_color(classes[idx]).tolist())  # Color based on class
-            draw_detection(img_out, boxes[idx], [labels[classes[idx]]], scores[idx] * 100.0, color)
+            color = tuple(id_to_color(classes[idx]).tolist())
+            if distances is not None:
+                x1, y1, x2, y2 = boxes[idx]
+                depth_roi = distances[int(y1):int(y2), int(x1):int(x2)]
+                min_depth = depth_roi.min() if depth_roi.size > 0 else 0.0
+                dist_label = f"{min_depth/1000:.2f}m"
+            else:
+                dist_label = None
+            label = [labels[classes[idx]]]
+            if dist_label:
+                print(f"detected distance = {min_depth/1000:.2f}m")
+                label.append(dist_label)
+            draw_detection(img_out, boxes[idx], label, scores[idx] * 100.0, color)
 
     return img_out
 
